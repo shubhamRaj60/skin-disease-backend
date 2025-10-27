@@ -1,0 +1,24 @@
+# Environment & secrets
+.env
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Model files
+models/*.h5
+models/backup/
+
+# Uploaded files
+uploads/
+explanations/
+
+# Logs
+*.log
+
+# OS / IDE files
+.DS_Store
+.vscode/
