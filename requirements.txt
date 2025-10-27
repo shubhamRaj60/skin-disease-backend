@@ -3,6 +3,8 @@ flask-cors==4.0.0
 flask-mysql==1.5.2
 mysql-connector-python==8.1.0
 tensorflow==2.13.0
+keras==2.13.1
+numpy==1.24.3
 numpy==1.24.3
 pillow==10.0.0
 opencv-python==4.8.1.78
