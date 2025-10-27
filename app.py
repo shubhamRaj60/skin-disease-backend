@@ -29,13 +29,6 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
-# Initialize database and load models for Gunicorn
-initialize_database()
-load_models()
-
-# Configuration
-PORT = os.getenv('PORT', 5001)
-
 # Database Configuration
 db_config = {
     'host': os.getenv('DB_HOST'),
@@ -44,79 +37,6 @@ db_config = {
     'database': os.getenv('DB_NAME')
 }
 
-# Global model variable
-unified_model = None
-
-# Global variables for retraining status
-retraining_status = {
-    'is_retraining': False,
-    'progress': 0,
-    'current_step': '',
-    'last_retraining': None,
-    'accuracy_improvement': 0
-}
-
-# HAM10000 Dataset Classes
-HAM10000_CLASSES = ['akiec', 'bcc', 'bkl', 'df', 'mel', 'nv', 'vasc']
-
-HUMAN_READABLE_NAMES = {
-    'akiec': 'Actinic Keratosis',
-    'bcc': 'Basal Cell Carcinoma',
-    'bkl': 'Benign Keratosis',
-    'df': 'Dermatofibroma',
-    'mel': 'Melanoma',
-    'nv': 'Melanocytic Nevus',
-    'vasc': 'Vascular Lesion'
-}
-
-# Cancer indicators for HAM10000 classes
-CANCER_INDICATORS = {
-    'akiec': True,    # Pre-cancerous / cancerous
-    'bcc': True,      # Cancerous
-    'bkl': False,     # Non-cancerous
-    'df': False,      # Non-cancerous
-    'mel': True,      # Cancerous
-    'nv': False,      # Non-cancerous
-    'vasc': False     # Non-cancerous
-}
-
-# Medical feature descriptions optimized for HAM10000
-MEDICAL_FEATURES = {
-    'border_irregularity': {
-        'description': 'Irregular or poorly defined borders',
-        'significance': {
-            'Melanoma': 'Highly significant - irregular borders are a key ABCDE feature',
-            'Basal Cell Carcinoma': 'Common in BCC - pearly borders with rolled edges',
-            'Actinic Keratosis': 'Often has irregular borders in early stages'
-        }
-    },
-    'asymmetry': {
-        'description': 'Lack of symmetry in the lesion',
-        'significance': {
-            'Melanoma': 'Critical feature - asymmetry is a major warning sign',
-            'Basal Cell Carcinoma': 'Often asymmetric',
-            'Melanocytic Nevus': 'Typically symmetric in benign cases'
-        }
-    },
-    'color_variation': {
-        'description': 'Multiple colors within the same lesion',
-        'significance': {
-            'Melanoma': 'Highly significant - multiple colors indicate malignancy',
-            'Basal Cell Carcinoma': 'Often pearly or translucent with telangiectasia',
-            'Benign Keratosis': 'Usually uniform in color'
-        }
-    },
-    'diameter_large': {
-        'description': 'Larger than 6mm in diameter',
-        'significance': {
-            'Melanoma': 'Warning sign - though melanomas can be smaller',
-            'Basal Cell Carcinoma': 'Can vary in size',
-            'Melanocytic Nevus': 'Often larger but stable in benign cases'
-        }
-    }
-}
-
-
 def get_db_connection():
     """Create database connection"""
     try:
@@ -124,8 +44,7 @@ def get_db_connection():
     except Exception as e:
         print(f"Database connection error: {e}")
         return None
-
-
+    
 def initialize_database():
     """Initialize database tables if they don't exist"""
     try:
@@ -218,6 +137,113 @@ def initialize_database():
 
     except Exception as e:
         print(f"Database initialization error: {e}")
+
+def load_models():
+    """Load unified TensorFlow model"""
+    global unified_model
+
+    try:
+        print('Loading ResNet model for HAM10000...')
+
+        # Load the unified model
+        unified_model = tf.keras.models.load_model('models/resnet_model.h5')
+
+        print('Resnet model loaded successfully')
+        print(f'Model input shape: {unified_model.input_shape}')
+        print(f'Model output shape: {unified_model.output_shape}')
+        print(f'Number of classes: {unified_model.output_shape[-1]}')
+
+    except Exception as e:
+        print(f'Error loading model: {e}')
+        print('Server will run without AI functionality')
+        
+
+# Initialize database and load models for Gunicorn
+initialize_database()
+load_models()
+
+# Configuration
+PORT = os.getenv('PORT', 5001)
+
+
+
+# Global model variable
+unified_model = None
+
+# Global variables for retraining status
+retraining_status = {
+    'is_retraining': False,
+    'progress': 0,
+    'current_step': '',
+    'last_retraining': None,
+    'accuracy_improvement': 0
+}
+
+# HAM10000 Dataset Classes
+HAM10000_CLASSES = ['akiec', 'bcc', 'bkl', 'df', 'mel', 'nv', 'vasc']
+
+HUMAN_READABLE_NAMES = {
+    'akiec': 'Actinic Keratosis',
+    'bcc': 'Basal Cell Carcinoma',
+    'bkl': 'Benign Keratosis',
+    'df': 'Dermatofibroma',
+    'mel': 'Melanoma',
+    'nv': 'Melanocytic Nevus',
+    'vasc': 'Vascular Lesion'
+}
+
+# Cancer indicators for HAM10000 classes
+CANCER_INDICATORS = {
+    'akiec': True,    # Pre-cancerous / cancerous
+    'bcc': True,      # Cancerous
+    'bkl': False,     # Non-cancerous
+    'df': False,      # Non-cancerous
+    'mel': True,      # Cancerous
+    'nv': False,      # Non-cancerous
+    'vasc': False     # Non-cancerous
+}
+
+# Medical feature descriptions optimized for HAM10000
+MEDICAL_FEATURES = {
+    'border_irregularity': {
+        'description': 'Irregular or poorly defined borders',
+        'significance': {
+            'Melanoma': 'Highly significant - irregular borders are a key ABCDE feature',
+            'Basal Cell Carcinoma': 'Common in BCC - pearly borders with rolled edges',
+            'Actinic Keratosis': 'Often has irregular borders in early stages'
+        }
+    },
+    'asymmetry': {
+        'description': 'Lack of symmetry in the lesion',
+        'significance': {
+            'Melanoma': 'Critical feature - asymmetry is a major warning sign',
+            'Basal Cell Carcinoma': 'Often asymmetric',
+            'Melanocytic Nevus': 'Typically symmetric in benign cases'
+        }
+    },
+    'color_variation': {
+        'description': 'Multiple colors within the same lesion',
+        'significance': {
+            'Melanoma': 'Highly significant - multiple colors indicate malignancy',
+            'Basal Cell Carcinoma': 'Often pearly or translucent with telangiectasia',
+            'Benign Keratosis': 'Usually uniform in color'
+        }
+    },
+    'diameter_large': {
+        'description': 'Larger than 6mm in diameter',
+        'significance': {
+            'Melanoma': 'Warning sign - though melanomas can be smaller',
+            'Basal Cell Carcinoma': 'Can vary in size',
+            'Melanocytic Nevus': 'Often larger but stable in benign cases'
+        }
+    }
+}
+
+
+
+
+
+
 def initialize_preventive_care():
     """Initialize preventive care information"""
     try:
@@ -321,24 +347,7 @@ def initialize_preventive_care():
         print(f"Preventive care initialization error: {e}")
 
 
-def load_models():
-    """Load unified TensorFlow model"""
-    global unified_model
 
-    try:
-        print('Loading ResNet model for HAM10000...')
-
-        # Load the unified model
-        unified_model = tf.keras.models.load_model('models/resnet_model.h5')
-
-        print('Resnet model loaded successfully')
-        print(f'Model input shape: {unified_model.input_shape}')
-        print(f'Model output shape: {unified_model.output_shape}')
-        print(f'Number of classes: {unified_model.output_shape[-1]}')
-
-    except Exception as e:
-        print(f'Error loading model: {e}')
-        print('Server will run without AI functionality')
 
 
 def preprocess_image(image_data):
