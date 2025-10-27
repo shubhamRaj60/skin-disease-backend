@@ -29,6 +29,10 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
+# Initialize database and load models for Gunicorn
+initialize_database()
+load_models()
+
 # Configuration
 PORT = os.getenv('PORT', 5001)
 
@@ -2086,14 +2090,6 @@ def health_check():
 
 if __name__ == '__main__':
     try:
-        # Initialize database first
-        print("Initializing database...")
-        initialize_database()
-
-        # Load model on startup
-        load_models()
-        print("Starting server...")
-
         # Create necessary directories
         os.makedirs('uploads', exist_ok=True)
         os.makedirs('explanations', exist_ok=True)
