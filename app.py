@@ -888,6 +888,15 @@ def get_mock_retraining_metrics():
         'message': 'Using mock data for development'
     }
 
+
+@app.route('/')
+def home():
+    """Health check route for Render."""
+    return jsonify({
+        'status': 'healthy',
+        'message': 'Service is running'
+    })
+    
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
