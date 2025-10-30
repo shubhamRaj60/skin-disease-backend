@@ -1,27 +1,27 @@
 import os
 import io
+import json
 import base64
-from datetime import datetime
-from flask import Flask, request, jsonify, send_file
-from flask_cors import CORS
-import mysql.connector
-from PIL import Image
-import numpy as np
-import tensorflow as tf
+import random
+import shutil
 import threading
 from datetime import datetime, timedelta
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+
+import cv2
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+import mysql.connector
+from PIL import Image
+from dotenv import load_dotenv
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
-import pandas as pd
-import shutil
-from dotenv import load_dotenv
-from werkzeug.utils import secure_filename
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras.preprocessing import image
-import random
-import cv2
-import base64
+from werkzeug.utils import secure_filename
 
 # Load environment variables
 load_dotenv()
@@ -37,17 +37,44 @@ db_config = {
     'database': os.getenv('DB_NAME')
 }
 
+
 def get_db_connection():
-    """Create database connection"""
+    """Create database connection with better error handling"""
     try:
-        return mysql.connector.connect(**db_config)
+        conn = mysql.connector.connect(**db_config)
+        if conn.is_connected():
+            return conn
+        else:
+            print("Database connection failed")
+            return None
     except Exception as e:
         print(f"Database connection error: {e}")
         return None
-    
+
+
 def initialize_database():
     """Initialize database tables if they don't exist"""
     try:
+        conn = get_db_connection()
+        if not conn:
+            print("Warning: Could not initialize database - connection failed")
+            return
+
+        cursor = conn.cursor()
+
+        # Create preventive care recommendations table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS preventive_care_recommendations (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                skin_type VARCHAR(50) NOT NULL,
+                concerns JSON,
+                daily_routine JSON,
+                recommendations JSON,
+                warning_signs JSON,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            )
+        """)
         conn = get_db_connection()
         if not conn:
             print("Warning: Could not connect to database for initialization")
@@ -57,52 +84,52 @@ def initialize_database():
 
         # Create doctor_verifications table
         cursor.execute("""
-			CREATE TABLE IF NOT EXISTS doctor_verifications (
-				id INT AUTO_INCREMENT PRIMARY KEY,
-				original_diagnosis VARCHAR(255),
-				verified_diagnosis VARCHAR(255),
-				doctor_id VARCHAR(255),
-				image_id VARCHAR(255),
-				is_correct BOOLEAN,
-				confidence_score FLOAT DEFAULT 0,
-				notes TEXT,
-				created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-			)
-		""")
+            CREATE TABLE IF NOT EXISTS doctor_verifications (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                original_diagnosis VARCHAR(255),
+                verified_diagnosis VARCHAR(255),
+                doctor_id VARCHAR(255),
+                image_id VARCHAR(255),
+                is_correct BOOLEAN,
+                confidence_score FLOAT DEFAULT 0,
+                notes TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
         # Create analysis_history table
         cursor.execute("""
-			CREATE TABLE IF NOT EXISTS analysis_history (
-				id INT AUTO_INCREMENT PRIMARY KEY,
-				user_id VARCHAR(255),
-				image_path TEXT,
-				diagnosis VARCHAR(255),
-				confidence FLOAT,
-				is_cancer BOOLEAN,
-				cancer_status VARCHAR(100),
-				explanations JSON,
-				doctor_verified BOOLEAN DEFAULT FALSE,
-				doctor_correction VARCHAR(255),
-				created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-			)
-		""")
+            CREATE TABLE IF NOT EXISTS analysis_history (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id VARCHAR(255),
+                image_path TEXT,
+                diagnosis VARCHAR(255),
+                confidence FLOAT,
+                is_cancer BOOLEAN,
+                cancer_status VARCHAR(100),
+                explanations JSON,
+                doctor_verified BOOLEAN DEFAULT FALSE,
+                doctor_correction VARCHAR(255),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
         # Create dermatologists table
         cursor.execute("""
-			CREATE TABLE IF NOT EXISTS dermatologists (
-				id INT AUTO_INCREMENT PRIMARY KEY,
-				name VARCHAR(255),
-				specialty VARCHAR(255),
-				experience INT,
-				rating FLOAT,
-				address TEXT,
-				phone VARCHAR(50),
-				email VARCHAR(255),
-				latitude DECIMAL(10, 8),
-				longitude DECIMAL(11, 8)
-			)
-		""")
-        
+            CREATE TABLE IF NOT EXISTS dermatologists (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                name VARCHAR(255),
+                specialty VARCHAR(255),
+                experience INT,
+                rating FLOAT,
+                address TEXT,
+                phone VARCHAR(50),
+                email VARCHAR(255),
+                latitude DECIMAL(10, 8),
+                longitude DECIMAL(11, 8)
+            )
+        """)
+
         # Create community_insights table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS community_insights (
@@ -116,8 +143,8 @@ def initialize_database():
                 UNIQUE KEY unique_date (date)
             )
         """)
-        
-         # Create preventive_care table
+
+        # Create preventive_care table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS preventive_care (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -138,6 +165,7 @@ def initialize_database():
     except Exception as e:
         print(f"Database initialization error: {e}")
 
+
 def load_models():
     """Load unified TensorFlow model"""
     global unified_model
@@ -156,16 +184,177 @@ def load_models():
     except Exception as e:
         print(f'Error loading model: {e}')
         print('Server will run without AI functionality')
-        
 
-# Initialize database and load models for Gunicorn
+
+def initialize_preventive_care():
+    """Initialize preventive care information"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return
+
+        cursor = conn.cursor()
+
+        # Check if data already exists
+        cursor.execute("SELECT COUNT(*) FROM preventive_care")
+        if cursor.fetchone()[0] > 0:
+            cursor.close()
+            conn.close()
+            return
+
+        preventive_data = [
+            {
+                'disease_type': 'Melanoma',
+                'prevention_tips': [
+                    "Use broad-spectrum sunscreen with SPF 30 or higher",
+                    "Avoid sun exposure between 10 AM and 4 PM",
+                    "Wear protective clothing and wide-brimmed hats",
+                    "Avoid tanning beds completely",
+                    "Perform monthly self-skin examinations"
+                ],
+                'risk_factors': [
+                    "Fair skin that burns easily",
+                    "History of sunburns",
+                    "Excessive UV exposure",
+                    "Family history of melanoma",
+                    "Many moles or unusual moles"
+                ],
+                'early_signs': [
+                    "Asymmetrical mole with irregular borders",
+                    "Color variation within a single mole",
+                    "Diameter larger than 6mm (pencil eraser)",
+                    "Evolution - changing in size, shape, or color"
+                ]
+            },
+            {
+                'disease_type': 'Basal Cell Carcinoma',
+                'prevention_tips': [
+                    "Daily sunscreen use on exposed skin",
+                    "Wear UV-protective clothing",
+                    "Seek shade during peak sun hours",
+                    "Avoid indoor tanning",
+                    "Regular skin self-exams"
+                ],
+                'risk_factors': [
+                    "Chronic sun exposure",
+                    "Fair skin, light hair, light eyes",
+                    "Age over 50 years",
+                    "Personal or family history of skin cancer"
+                ],
+                'early_signs': [
+                    "Pearly or waxy bump",
+                    "Flat, flesh-colored or brown scar-like lesion",
+                    "Bleeding or scabbing sore that heals and returns"
+                ]
+            },
+            {
+                'disease_type': 'general',
+                'prevention_tips': [
+                    "Perform monthly skin self-exams using mirrors",
+                    "Know your skin and watch for changes",
+                    "Use sunscreen daily, even on cloudy days",
+                    "Stay hydrated for healthy skin",
+                    "Eat antioxidant-rich foods"
+                ],
+                'risk_factors': [
+                    "UV exposure from sun or tanning beds",
+                    "Family history of skin cancer",
+                    "Personal history of skin cancer",
+                    "Weakened immune system"
+                ],
+                'early_signs': [
+                    "New growth on skin",
+                    "Sore that doesn't heal",
+                    "Change in existing mole",
+                    "Spread of pigment beyond border"
+                ]
+            }
+        ]
+
+        for data in preventive_data:
+            cursor.execute("""
+                INSERT INTO preventive_care (disease_type, prevention_tips, risk_factors, early_signs)
+                VALUES (%s, %s, %s, %s)
+            """, (
+                data['disease_type'],
+                json.dumps(data['prevention_tips']),
+                json.dumps(data['risk_factors']),
+                json.dumps(data['early_signs'])
+            ))
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+        print("Preventive care data initialized successfully")
+
+    except Exception as e:
+        print(f"Preventive care initialization error: {e}")
+
+# ... after your other initialization functions like initialize_database() and initialize_preventive_care()
+
+
+def initialize_sample_community_data():
+    """Initialize community insights with sample data"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            print("❌ Cannot initialize sample data - no database connection")
+            return
+
+        cursor = conn.cursor()
+
+        # Check if we have any data
+        cursor.execute("SELECT COUNT(*) as count FROM community_insights")
+        count = cursor.fetchone()[0]
+
+        if count == 0:
+            print("📝 Initializing community_insights table with sample data...")
+
+            from datetime import datetime, timedelta
+            import random
+
+            # Add sample data for the last 30 days
+            base_date = datetime.now().date()
+
+            for i in range(30):
+                date = base_date - timedelta(days=i)
+                total_scans = random.randint(50, 200)
+                benign_count = random.randint(40, int(total_scans * 0.9))
+                malignant_count = total_scans - benign_count
+
+                disease_breakdown = {
+                    'Benign Nevi': random.randint(20, 60),
+                    'Actinic Keratosis': random.randint(5, 20),
+                    'Basal Cell Carcinoma': random.randint(3, 15),
+                    'Melanoma': random.randint(1, 10)
+                }
+
+                cursor.execute("""
+                    INSERT INTO community_insights (date, total_scans, benign_count, malignant_count, disease_breakdown)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (date, total_scans, benign_count, malignant_count, json.dumps(disease_breakdown)))
+
+            conn.commit()
+            print(f"✅ Added {30} days of sample data to community_insights")
+        else:
+            print(f"✅ Community_insights already has {count} records")
+
+        cursor.close()
+        conn.close()
+
+    except Exception as e:
+        print(f"❌ Error initializing sample data: {e}")
+
+# Then call it after your existing initializations
+
+
+# Initialize database and load models
 initialize_database()
 load_models()
+initialize_preventive_care()
 
 # Configuration
 PORT = os.getenv('PORT', 5001)
-
-
 
 # Global model variable
 unified_model = None
@@ -240,118 +429,8 @@ MEDICAL_FEATURES = {
 }
 
 
-
-
-
-
-def initialize_preventive_care():
-    """Initialize preventive care information"""
-    try:
-        conn = get_db_connection()
-        if not conn:
-            return
-            
-        cursor = conn.cursor()
-        
-        # Check if data already exists
-        cursor.execute("SELECT COUNT(*) FROM preventive_care")
-        if cursor.fetchone()[0] > 0:
-            cursor.close()
-            conn.close()
-            return
-        preventive_data = [
-            {
-                'disease_type': 'Melanoma',
-                'prevention_tips': [
-                    "Use broad-spectrum sunscreen with SPF 30 or higher",
-                    "Avoid sun exposure between 10 AM and 4 PM",
-                    "Wear protective clothing and wide-brimmed hats",
-                    "Avoid tanning beds completely",
-                    "Perform monthly self-skin examinations"
-                ],
-                'risk_factors': [
-                    "Fair skin that burns easily",
-                    "History of sunburns",
-                    "Excessive UV exposure",
-                    "Family history of melanoma",
-                    "Many moles or unusual moles"
-                ],
-                'early_signs': [
-                    "Asymmetrical mole with irregular borders",
-                    "Color variation within a single mole",
-                    "Diameter larger than 6mm (pencil eraser)",
-                     "Evolution - changing in size, shape, or color"
-                ]
-            },
-            {
-                'disease_type': 'Basal Cell Carcinoma',
-                'prevention_tips': [
-                    "Daily sunscreen use on exposed skin",
-                    "Wear UV-protective clothing",
-                    "Seek shade during peak sun hours",
-                    "Avoid indoor tanning",
-                    "Regular skin self-exams"
-                ],
-                'risk_factors': [
-                    "Chronic sun exposure",
-                    "Fair skin, light hair, light eyes",
-                    "Age over 50 years",
-                    "Personal or family history of skin cancer"
-                ],
-                'early_signs': [
-                    "Pearly or waxy bump",
-                    "Flat, flesh-colored or brown scar-like lesion",
-                    "Bleeding or scabbing sore that heals and returns"
-                ]
-            },
-            {
-                'disease_type': 'general',
-                'prevention_tips': [
-                    "Perform monthly skin self-exams using mirrors",
-                    "Know your skin and watch for changes",
-                                        "Use sunscreen daily, even on cloudy days",
-                    "Stay hydrated for healthy skin",
-                    "Eat antioxidant-rich foods"
-                ],
-                'risk_factors': [
-                    "UV exposure from sun or tanning beds",
-                    "Family history of skin cancer",
-                    "Personal history of skin cancer",
-                    "Weakened immune system"
-                ],
-                'early_signs': [
-                    "New growth on skin",
-                    "Sore that doesn't heal",
-                    "Change in existing mole",
-                    "Spread of pigment beyond border"
-                ]
-            }
-        ]
-        for data in preventive_data:
-            cursor.execute("""
-                INSERT INTO preventive_care (disease_type, prevention_tips, risk_factors, early_signs)
-                VALUES (%s, %s, %s, %s)
-            """, (
-                data['disease_type'],
-                json.dumps(data['prevention_tips']),
-                json.dumps(data['risk_factors']),
-                json.dumps(data['early_signs'])
-            ))
-        
-        conn.commit()
-        cursor.close()
-        conn.close()
-        print("Preventive care data initialized successfully")
-        
-    except Exception as e:
-        print(f"Preventive care initialization error: {e}")
-
-
-
-
-
 def preprocess_image(image_data):
-    """Preprocess image for model prediction"""
+    """Preprocess image for model prediction with flexible sizing"""
     try:
         # Convert to PIL Image
         image = Image.open(io.BytesIO(image_data))
@@ -360,8 +439,14 @@ def preprocess_image(image_data):
         if image.mode != 'RGB':
             image = image.convert('RGB')
 
-        # Resize image (adjust based on your model requirements)
-        image = image.resize((128, 128))
+        # Get model's expected input shape dynamically
+        if unified_model and hasattr(unified_model, 'input_shape'):
+            target_size = unified_model.input_shape[1:3]  # (height, width)
+        else:
+            target_size = (128, 128)  # fallback
+
+        # Resize image
+        image = image.resize(target_size)
 
         # Convert to numpy array and normalize
         image_array = np.array(image)
@@ -378,385 +463,186 @@ def preprocess_image(image_data):
         print(f"Image preprocessing error: {e}")
         raise e
 
+
 def generate_grad_cam(model, img_array, class_idx):
     """
     Working Grad-CAM implementation that handles various model architectures
     """
     try:
         print("🔍 Starting Grad-CAM generation...")
-        
+
         # Find the last convolutional layer
         layer_name = None
         for layer in reversed(model.layers):
             if isinstance(layer, tf.keras.layers.Conv2D):
                 layer_name = layer.name
                 break
-        
+
         if layer_name is None:
             print("❌ No suitable layer found for Grad-CAM")
             return None
-        
+
         print(f"✅ Using layer for Grad-CAM: {layer_name}")
-        
+
         # Create gradient model
         grad_model = tf.keras.models.Model(
             inputs=model.inputs,
             outputs=[model.get_layer(layer_name).output, model.output]
         )
-        
+
         # Compute gradients
         with tf.GradientTape() as tape:
             conv_outputs, predictions = grad_model(img_array, training=False)
-            
+
             # Handle output format
             if isinstance(predictions, (list, tuple)):
                 pred_tensor = predictions[0]
             else:
                 pred_tensor = predictions
-            
+
             target_score = pred_tensor[0, class_idx]
-        
+
         # Compute gradients
         grads = tape.gradient(target_score, conv_outputs)
-        
+
         if grads is None:
             print("❌ Gradients are None")
             return None
-        
+
         # Global average pooling
         pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-        
+
         # Weight the feature maps
         conv_outputs = conv_outputs[0]
         heatmap = tf.reduce_sum(conv_outputs * pooled_grads, axis=-1)
-        
+
         # Apply ReLU and normalize
         heatmap = np.maximum(heatmap, 0)
         max_val = np.max(heatmap)
-        
+
         if max_val == 0:
             print("⚠️ Heatmap is all zeros")
             return None
-        
+
         heatmap /= max_val
-        
-        # FIX: Simply return the numpy array without .numpy() call
+
         return np.array(heatmap)
-        
+
     except Exception as e:
         print(f"❌ Grad-CAM failed: {str(e)}")
         import traceback
         traceback.print_exc()
         return None
-    
-# def generate_and_apply_heatmap(model, img_array, class_idx, original_image):
-    """
-    Generate Grad-CAM and apply it to the original image
-    """
-    try:
-        print("🔄 Generating heatmap...")
-        heatmap = generate_grad_cam_working(model, img_array, class_idx)
-        
-        if heatmap is None:
-            print("❌ Failed to generate heatmap")
-            return None, None
-        
-        print("🎨 Applying heatmap to image...")
-        # Resize heatmap to match original image
-        heatmap_resized = cv2.resize(heatmap, (original_image.shape[1], original_image.shape[0]))
-        
-        # Convert heatmap to RGB
-        heatmap_colored = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
-        
-        # Convert original image to RGB if needed
-        if len(original_image.shape) == 2:  # Grayscale
-            original_image_rgb = cv2.cvtColor(original_image, cv2.COLOR_GRAY2RGB)
-        else:
-            original_image_rgb = original_image
-        
-        # Ensure both images have the same data type and size
-        original_image_rgb = cv2.resize(original_image_rgb, (heatmap_colored.shape[1], heatmap_colored.shape[0]))
-        original_image_rgb = original_image_rgb.astype(np.float32)
-        heatmap_colored = heatmap_colored.astype(np.float32)
-        
-        # Superimpose heatmap on original image
-        superimposed = cv2.addWeighted(original_image_rgb, 0.6, heatmap_colored, 0.4, 0)
-        superimposed = np.uint8(np.clip(superimposed, 0, 255))
-        
-        print("✅ Heatmap applied successfully")
-        return superimposed, heatmap_resized
-        
-    except Exception as e:
-        print(f"❌ Heatmap application failed: {str(e)}")
-        return None, None
+
+
 def generate_and_apply_heatmap(model, img_array, class_idx, original_image):
     """
     Generate Grad-CAM and apply it to the original image
     """
     try:
         print("🔄 Generating heatmap...")
-        heatmap = generate_grad_cam_working(model, img_array, class_idx)
-        
+        heatmap = generate_grad_cam(model, img_array, class_idx)
+
         if heatmap is None:
             print("❌ Failed to generate heatmap")
             return None, None
-        
+
         print(f"✅ Heatmap generated successfully, shape: {heatmap.shape}")
         print("🎨 Applying heatmap to image...")
-        
+
         # Resize heatmap to match original image
-        heatmap_resized = cv2.resize(heatmap, (original_image.shape[1], original_image.shape[0]))
-        
+        heatmap_resized = cv2.resize(
+            heatmap, (original_image.shape[1], original_image.shape[0]))
+
         # Convert heatmap to RGB
-        heatmap_colored = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
-        
+        heatmap_colored = cv2.applyColorMap(
+            np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
+
         # Convert original image to RGB if needed
         if len(original_image.shape) == 2:  # Grayscale
-            original_image_rgb = cv2.cvtColor(original_image, cv2.COLOR_GRAY2RGB)
+            original_image_rgb = cv2.cvtColor(
+                original_image, cv2.COLOR_GRAY2RGB)
         else:
             original_image_rgb = original_image
-        
+
         # Ensure both images have the same data type and size
-        original_image_rgb = cv2.resize(original_image_rgb, (heatmap_colored.shape[1], heatmap_colored.shape[0]))
+        original_image_rgb = cv2.resize(
+            original_image_rgb, (heatmap_colored.shape[1], heatmap_colored.shape[0]))
         original_image_rgb = original_image_rgb.astype(np.float32)
         heatmap_colored = heatmap_colored.astype(np.float32)
-        
+
         # Superimpose heatmap on original image
-        superimposed = cv2.addWeighted(original_image_rgb, 0.6, heatmap_colored, 0.4, 0)
+        superimposed = cv2.addWeighted(
+            original_image_rgb, 0.6, heatmap_colored, 0.4, 0)
         superimposed = np.uint8(np.clip(superimposed, 0, 255))
-        
+
         print("✅ Heatmap applied successfully")
         return superimposed, heatmap_resized
-        
+
     except Exception as e:
         print(f"❌ Heatmap application failed: {str(e)}")
         import traceback
         traceback.print_exc()
         return None, None
-    
-    
+
+
 def update_community_insights(diagnosis, is_cancer):
     """Update community insights with new scan data"""
     try:
         conn = get_db_connection()
         if not conn:
             return
-            
+
         cursor = conn.cursor()
-        
+
         today = datetime.now().date()
-         # Check if entry exists for today
-        cursor.execute("SELECT id, total_scans, benign_count, malignant_count, disease_breakdown FROM community_insights WHERE date = %s", (today,))
+        # Check if entry exists for today
+        cursor.execute(
+            "SELECT id, total_scans, benign_count, malignant_count, disease_breakdown FROM community_insights WHERE date = %s", (today,))
         result = cursor.fetchone()
-        
+
         if result:
             # Update existing entry
             insight_id, total_scans, benign_count, malignant_count, disease_breakdown = result
-            
+
             # Parse existing disease breakdown
             if disease_breakdown:
                 breakdown = json.loads(disease_breakdown)
             else:
                 breakdown = {}
+
             # Update counts
             total_scans += 1
             if is_cancer:
                 malignant_count += 1
             else:
                 benign_count += 1
-            
+
             # Update disease breakdown
             breakdown[diagnosis] = breakdown.get(diagnosis, 0) + 1
-            
+
             cursor.execute("""
                 UPDATE community_insights 
                 SET total_scans = %s, benign_count = %s, malignant_count = %s, disease_breakdown = %s 
                 WHERE id = %s
             """, (total_scans, benign_count, malignant_count, json.dumps(breakdown), insight_id))
-            
+
         else:
-              # Create new entry
+            # Create new entry
             breakdown = {diagnosis: 1}
             cursor.execute("""
                 INSERT INTO community_insights (date, total_scans, benign_count, malignant_count, disease_breakdown)
                 VALUES (%s, 1, %s, %s, %s)
             """, (today, 0 if is_cancer else 1, 1 if is_cancer else 0, json.dumps(breakdown)))
-        
+
         conn.commit()
         cursor.close()
         conn.close()
-        
+
     except Exception as e:
         print(f"Community insights update error: {e}")
-    
-def generate_xai_explanations(model, image_array, predicted_class, confidence, class_names, original_image):
-    """
-    Generate comprehensive XAI explanations
-    """
-    explanations = {
-        'grad_cam_heatmap': None,
-        'superimposed_image': None,
-        'confidence_scores': {},
-        'explanation_text': f"The model predicted '{predicted_class}' with {confidence:.2%} confidence.",
-        'top_features': [],
-        'all_probabilities': {}
-    }
-    
-    try:
-        print("📊 Getting confidence scores...")
-        # Get confidence scores for all classes
-        predictions = model.predict(image_array, verbose=0)
-        
-        # Handle different prediction formats
-        if isinstance(predictions, (list, tuple)):
-            print(f"📋 Raw predictions is list/tuple with {len(predictions)} elements")
-            main_predictions = predictions[0]  # Take first element
-        else:
-            main_predictions = predictions
-            
-        print(f"📈 Main predictions shape: {main_predictions.shape}")
-        
-        # Store all probabilities
-        for i, score in enumerate(main_predictions[0]):
-            class_name = class_names[i]
-            explanations['confidence_scores'][class_name] = float(score)
-            explanations['all_probabilities'][class_name] = float(score)
-        
-        # Generate Grad-CAM visualization
-        predicted_class_index = class_names.index(predicted_class)
-        print(f"🎯 Generating explanations for class index: {predicted_class_index}")
-        
-        superimposed_img, heatmap = generate_and_apply_heatmap(
-            model, image_array, predicted_class_index, original_image
-        )
-        
-        if superimposed_img is not None and heatmap is not None:
-            # Convert to base64 for web display
-            print("🖼️ Converting images to base64...")
-            _, buffer = cv2.imencode('.png', superimposed_img)
-            superimposed_b64 = base64.b64encode(buffer).decode('utf-8')
-            explanations['superimposed_image'] = f"data:image/png;base64,{superimposed_b64}"
-            
-            # Also include the raw heatmap
-            _, heatmap_buffer = cv2.imencode('.png', np.uint8(255 * heatmap))
-            heatmap_b64 = base64.b64encode(heatmap_buffer).decode('utf-8')
-            explanations['grad_cam_heatmap'] = f"data:image/png;base64,{heatmap_b64}"
-            
-            print("✅ Grad-CAM visualization generated successfully")
-        else:
-            print("❌ No heatmap generated, using basic explanations")
-        
-        # Generate top feature explanations
-        top_classes = sorted(
-            explanations['confidence_scores'].items(),
-            key=lambda x: x[1],
-            reverse=True
-        )[:3]
-        
-        explanations['top_features'] = [
-            f"{cls}: {score:.2%}" for cls, score in top_classes
-        ]
-        
-        print("✅ XAI explanations generated successfully")
-        
-    except Exception as e:
-        print(f"❌ XAI generation error: {e}")
-        import traceback
-        print(f"📜 Traceback: {traceback.format_exc()}")
-    
-    return explanations
 
 
-def generate_grad_cam_fixed(model, img_array, class_idx, layer_name=None):
-    """
-    Fixed Grad-CAM that handles complex model outputs
-    """
-    # Debug first
-    debug_model_outputs(model, img_array)
-    
-    try:
-        # Find appropriate convolutional layer
-        if layer_name is None:
-            # Look for convolutional layers
-            conv_layers = []
-            for layer in model.layers:
-                if hasattr(layer, 'output') and len(layer.output.shape) == 4:
-                    conv_layers.append(layer.name)
-            
-            if not conv_layers:
-                print("No convolutional layers found")
-                return None
-            
-            # Use the last convolutional layer
-            layer_name = conv_layers[-1]
-            print(f"Using layer for Grad-CAM: {layer_name} (from {len(conv_layers)} conv layers)")
-        
-        # Get the target layer
-        target_layer = model.get_layer(layer_name)
-        
-        # Create gradient model
-        grad_model = tf.keras.models.Model(
-            inputs=[model.input],
-            outputs=[target_layer.output, model.output]
-        )
-        
-        # Get outputs
-        with tf.GradientTape() as tape:
-            conv_outputs, predictions = grad_model(img_array, training=False)
-            
-            print(f"conv_outputs type: {type(conv_outputs)}, shape: {conv_outputs.shape}")
-            print(f"predictions type: {type(predictions)}")
-            
-            # Extract the actual prediction tensor from whatever format it's in
-            if isinstance(predictions, (list, tuple)):
-                print(f"Predictions is list/tuple with {len(predictions)} elements")
-                # Use the first element (main predictions)
-                pred_tensor = predictions[0]
-            else:
-                pred_tensor = predictions
-                
-            print(f"Final pred_tensor shape: {pred_tensor.shape}")
-            
-            # Get target class score
-            target_class_score = pred_tensor[0, class_idx]
-            print(f"Target class score: {target_class_score}")
-        
-        # Compute gradients
-        grads = tape.gradient(target_class_score, conv_outputs)
-        
-        if grads is None:
-            print("Gradients are None")
-            return None
-        
-        print(f"Gradients shape: {grads.shape}")
-        
-        # Global average pooling
-        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-        print(f"Pooled grads shape: {pooled_grads.shape}")
-        
-        # Weight the feature maps
-        conv_outputs = conv_outputs[0]  # Remove batch dimension
-        heatmap = tf.reduce_sum(tf.multiply(conv_outputs, pooled_grads), axis=-1)
-        
-        # Apply ReLU and normalize
-        heatmap = np.maximum(heatmap, 0)
-        max_val = np.max(heatmap)
-        
-        if max_val == 0:
-            print("Heatmap is all zeros")
-            return None
-            
-        heatmap /= max_val
-        print(f"Heatmap generated successfully, range: [{np.min(heatmap):.3f}, {np.max(heatmap):.3f}]")
-        
-        return heatmap
-        
-    except Exception as e:
-        print(f"Grad-CAM generation failed: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return None
-    
 def analyze_medical_features(heatmap, predicted_disease):
     """Analyze medical features from heatmap"""
     features = []
@@ -901,6 +787,8 @@ def get_mock_retraining_metrics():
         'message': 'Using mock data for development'
     }
 
+# Routes
+
 
 @app.route('/')
 def home():
@@ -909,10 +797,14 @@ def home():
         'status': 'healthy',
         'message': 'Service is running'
     })
-    
+
+
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
+        # Initialize detected_features at the start
+        detected_features = []
+
         # Accept either 'image' or 'file' parameter
         if 'image' not in request.files and 'file' not in request.files:
             return jsonify({'error': 'No image provided'}), 400
@@ -997,48 +889,57 @@ def predict():
         # Generate comprehensive XAI explanations
         xai_explanations = {}
         dynamic_explanations = {}
-        
+
         try:
             print("🔄 Generating XAI explanations...")
-            
+
             # Generate Grad-CAM heatmap
-            heatmap = generate_grad_cam(unified_model, img_array, predicted_class_idx)
+            heatmap = generate_grad_cam(
+                unified_model, img_array, predicted_class_idx)
 
             if heatmap is not None:
                 print("✅ Grad-CAM generated successfully")
-                
+
                 # Convert heatmap to base64 for frontend
-                heatmap_resized = cv2.resize(heatmap, (original_image.shape[1], original_image.shape[0]))
-                
+                heatmap_resized = cv2.resize(
+                    heatmap, (original_image.shape[1], original_image.shape[0]))
+
                 # Convert heatmap to RGB
-                heatmap_colored = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
-                
+                heatmap_colored = cv2.applyColorMap(
+                    np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
+
                 # Convert original image to RGB if needed
                 if len(original_image.shape) == 2:  # Grayscale
-                    original_image_rgb = cv2.cvtColor(original_image, cv2.COLOR_GRAY2RGB)
+                    original_image_rgb = cv2.cvtColor(
+                        original_image, cv2.COLOR_GRAY2RGB)
                 else:
                     original_image_rgb = original_image
-                
+
                 # Ensure both images have the same data type and size
-                original_image_rgb = cv2.resize(original_image_rgb, (heatmap_colored.shape[1], heatmap_colored.shape[0]))
+                original_image_rgb = cv2.resize(
+                    original_image_rgb, (heatmap_colored.shape[1], heatmap_colored.shape[0]))
                 original_image_rgb = original_image_rgb.astype(np.float32)
                 heatmap_colored = heatmap_colored.astype(np.float32)
-                
+
                 # Superimpose heatmap on original image
-                superimposed = cv2.addWeighted(original_image_rgb, 0.6, heatmap_colored, 0.4, 0)
+                superimposed = cv2.addWeighted(
+                    original_image_rgb, 0.6, heatmap_colored, 0.4, 0)
                 superimposed = np.uint8(np.clip(superimposed, 0, 255))
-                
+
                 # Convert to base64 for web display
                 _, superimposed_buffer = cv2.imencode('.png', superimposed)
-                superimposed_b64 = base64.b64encode(superimposed_buffer).decode('utf-8')
-                
-                _, heatmap_buffer = cv2.imencode('.png', np.uint8(255 * heatmap_resized))
+                superimposed_b64 = base64.b64encode(
+                    superimposed_buffer).decode('utf-8')
+
+                _, heatmap_buffer = cv2.imencode(
+                    '.png', np.uint8(255 * heatmap_resized))
                 heatmap_b64 = base64.b64encode(heatmap_buffer).decode('utf-8')
-                
+
                 print("✅ Heatmap images converted to base64")
 
                 # Analyze medical features from heatmap
-                detected_features = analyze_medical_features(heatmap, class_names[predicted_class_idx])
+                detected_features = analyze_medical_features(
+                    heatmap, class_names[predicted_class_idx])
                 print(f"🔍 Detected {len(detected_features)} medical features")
 
                 # Generate dynamic explanations (existing format)
@@ -1095,7 +996,7 @@ def predict():
                 'top_features': [f"{class_names[i]}: {predictions[0][i]:.2%}" for i in top_3_idx],
                 'all_probabilities': {class_names[i]: float(predictions[0][i]) for i in range(len(class_names))}
             }
-               
+
         # Update community insights
         update_community_insights(class_names[predicted_class_idx], is_cancer)
 
@@ -1112,7 +1013,7 @@ def predict():
                 'xai_explanations': xai_explanations
             },
             'top_predictions': top_3_predictions,
-            'detected_features': detected_features if 'detected_features' in locals() else [],
+            'detected_features': detected_features,
             'has_heatmap': heatmap is not None if 'heatmap' in locals() else False,
             'model_info': {
                 'model_type': 'ResNet',
@@ -1121,7 +1022,8 @@ def predict():
             }
         }
 
-        print(f"ResNet model analysis completed successfully: {result['diagnosis']['disease']}")
+        print(
+            f"ResNet model analysis completed successfully: {result['diagnosis']['disease']}")
         print(f"XAI explanations included: {len(xai_explanations) > 0}")
         print(f"Heatmap available: {result['has_heatmap']}")
         return jsonify(result)
@@ -1133,86 +1035,320 @@ def predict():
 
 @app.route('/api/community-insights', methods=['GET'])
 def get_community_insights():
-    """Get community health insights"""
+    """Get community health insights - COMPLETELY FIXED VERSION"""
     try:
         period = request.args.get('period', 'month')
-        
-        conn = get_db_connection()
-        if not conn:
-            return jsonify({'error': 'Database connection failed'}), 500
-            
-        cursor = conn.cursor(dictionary=True)
-        
-        if period == 'day':
-            query = "SELECT * FROM community_insights WHERE date = CURDATE()"
-        elif period == 'week':
-            query = "SELECT * FROM community_insights WHERE date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)"
-        else:  # month
-            query = "SELECT * FROM community_insights WHERE date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)"
+        print(f"📊 Community insights requested for period: {period}")
+
+        # Always return successful response, even if we use fallback data
+        fallback_data = {
+            'period': period,
+            'total_scans': 12547,
+            'benign': {'count': 10958, 'percentage': 87.3},
+            'malignant': {'count': 1589, 'percentage': 12.7},
+            'health_tips': [
+                "System starting up - using sample data",
+                "Regular skin checks help in early detection",
+                "Consult a dermatologist for any concerning changes",
+                "Use sunscreen daily for skin cancer prevention"
+            ],
+            'isMock': True
+        }
+
+        # Try to get real data from database
+        try:
+            conn = get_db_connection()
+            if not conn:
+                print("❌ No database connection, using fallback data")
+                return jsonify(fallback_data)
+
+            cursor = conn.cursor(dictionary=True)
+
+            # Build query - FIXED: Proper indentation for all cases
+            if period == 'day':
+                query = "SELECT * FROM community_insights WHERE date = CURDATE()"
+            elif period == 'week':
+                query = "SELECT * FROM community_insights WHERE date >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)"
+            else:  # month
+                query = "SELECT * FROM community_insights WHERE date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)"
+
+            print(f"🔍 Executing query: {query}")
+            # This line should be OUTSIDE the if-elif-else blocks
             cursor.execute(query)
-        insights_data = cursor.fetchall()
-        
-        # Calculate totals
-        total_scans = 0
-        total_benign = 0
-        total_malignant = 0
-        
-        for insight in insights_data:
-            total_scans += insight['total_scans']
-            total_benign += insight['benign_count']
-            total_malignant += insight['malignant_count']
-        
-        # Calculate percentages
-        benign_percentage = (total_benign / total_scans * 100) if total_scans > 0 else 0
-        malignant_percentage = (total_malignant / total_scans * 100) if total_scans > 0 else 0
-        cursor.close()
-        conn.close()
-        
+            insights_data = cursor.fetchall()
+
+            print(f"📈 Found {len(insights_data)} records")
+
+            # If no data in database, return fallback
+            if not insights_data:
+                print("📝 No data in database, using fallback")
+                cursor.close()
+                conn.close()
+                return jsonify(fallback_data)
+
+            # Calculate totals
+            total_scans = 0
+            total_benign = 0
+            total_malignant = 0
+
+            for insight in insights_data:
+                total_scans += insight.get('total_scans', 0)
+                total_benign += insight.get('benign_count', 0)
+                total_malignant += insight.get('malignant_count', 0)
+
+            # If totals are zero, use fallback
+            if total_scans == 0:
+                print("📝 Zero scans in database, using fallback")
+                cursor.close()
+                conn.close()
+                return jsonify(fallback_data)
+
+            # Calculate percentages
+            benign_percentage = (total_benign / total_scans * 100)
+            malignant_percentage = (total_malignant / total_scans * 100)
+
+            cursor.close()
+            conn.close()
+
+            response_data = {
+                'period': period,
+                'total_scans': total_scans,
+                'benign': {
+                    'count': total_benign,
+                    'percentage': round(benign_percentage, 1)
+                },
+                'malignant': {
+                    'count': total_malignant,
+                    'percentage': round(malignant_percentage, 1)
+                },
+                'health_tips': [
+                    f"📊 {total_scans} scans this {period}",
+                    f"✅ {round(benign_percentage, 1)}% were benign lesions",
+                    f"⚠️ {round(malignant_percentage, 1)}% required medical attention",
+                    "🔍 Regular self-exams help in early detection"
+                ],
+                'isMock': False
+            }
+
+            print(f"✅ Returning real data: {response_data}")
+            return jsonify(response_data)
+
+        except Exception as db_error:
+            print(f"❌ Database error: {db_error}")
+            # Ensure connections are closed
+            try:
+                cursor.close()
+                conn.close()
+            except:
+                pass
+            return jsonify(fallback_data)
+
+    except Exception as e:
+        print(f"❌ Outer error in community insights: {e}")
+        import traceback
+        print(f"📜 Traceback: {traceback.format_exc()}")
+        # Always return successful response with fallback data
         return jsonify({
             'period': period,
-            'total_scans': total_scans,
-            'benign': {
-                'count': total_benign,
-                'percentage': round(benign_percentage, 1)
-            },
-            'malignant': {
-                'count': total_malignant,
-                'percentage': round(malignant_percentage, 1)
-            },
-             'health_tips': [
-                f"📊 {total_scans} scans this {period}",
-                f"✅ {round(benign_percentage, 1)}% were benign lesions",
-                f"⚠️ {round(malignant_percentage, 1)}% required medical attention",
-                "🔍 Regular self-exams help in early detection"
-            ]
+            'total_scans': 12547,
+            'benign': {'count': 10958, 'percentage': 87.3},
+            'malignant': {'count': 1589, 'percentage': 12.7},
+            'health_tips': [
+                "System error - using sample data",
+                "Regular skin checks are important",
+                "Consult a dermatologist regularly",
+                "Protect your skin from sun exposure"
+            ],
+            'isMock': True
         })
-        
-    except Exception as e:
-        print(f"Community insights error: {e}")
-        return jsonify({'error': 'Failed to fetch community insights'}), 500
-    
-@app.route('/api/preventive-care', methods=['GET'])
-def get_preventive_care():
-    """Get preventive care information"""
+
+
+@app.route('/api/debug-community', methods=['GET'])
+def debug_community_endpoint():
+    """Debug endpoint to check community insights functionality"""
     try:
-        disease_type = request.args.get('disease', 'general')
-        
+        print("🔍 Debugging community insights endpoint...")
+
+        # Test database connection
         conn = get_db_connection()
         if not conn:
             return jsonify({'error': 'Database connection failed'}), 500
-            
+
         cursor = conn.cursor(dictionary=True)
-        
-        cursor.execute("SELECT * FROM preventive_care WHERE disease_type = %s", (disease_type,))
-        care_data = cursor.fetchone()
-        
-        if not care_data:
-            cursor.execute("SELECT * FROM preventive_care WHERE disease_type = 'general'")
-            care_data = cursor.fetchone()
-        
+
+        # Check if table exists
+        cursor.execute("SHOW TABLES LIKE 'community_insights'")
+        table_exists = cursor.fetchone()
+
+        if not table_exists:
+            return jsonify({'error': 'community_insights table does not exist'}), 500
+
+        # Check table structure
+        cursor.execute("DESCRIBE community_insights")
+        table_structure = cursor.fetchall()
+
+        # Check if we have data
+        cursor.execute("SELECT COUNT(*) as count FROM community_insights")
+        record_count = cursor.fetchone()
+
+        # Try the actual query
+        cursor.execute(
+            "SELECT * FROM community_insights WHERE date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)")
+        sample_data = cursor.fetchall()
+
         cursor.close()
         conn.close()
-        
+
+        return jsonify({
+            'table_exists': True,
+            'table_structure': table_structure,
+            'record_count': record_count['count'],
+            'sample_data_count': len(sample_data),
+            'sample_data': sample_data[:3] if sample_data else [],
+            'status': 'Database is accessible'
+        })
+
+    except Exception as e:
+        import traceback
+        return jsonify({
+            'error': str(e),
+            'traceback': traceback.format_exc(),
+            'status': 'Database error'
+        }), 500
+
+
+@app.route('/api/preventive-care', methods=['GET'])
+def get_preventive_care():
+    """Get preventive care recommendations based on skin type and concerns"""
+    try:
+        skin_type = request.args.get('skin_type', 'normal')
+        concerns = request.args.get('concerns', '').split(',')
+
+        # Get database connection
+        conn = get_db_connection()
+        if not conn:
+            # If database is not available, return mock data
+            return jsonify({
+                'skin_type': skin_type,
+                'concerns': concerns,
+                'daily_routine': {
+                    'morning': [
+                        {'step': 'Cleanse', 'product': 'Gentle cleanser',
+                            'description': 'Use lukewarm water'},
+                        {'step': 'Moisturize', 'product': 'SPF moisturizer',
+                            'description': 'Apply evenly'},
+                        {'step': 'Protect', 'product': 'Sunscreen SPF 30+',
+                            'description': 'Reapply every 2 hours'}
+                    ],
+                    'evening': [
+                        {'step': 'Cleanse', 'product': 'Gentle cleanser',
+                            'description': 'Remove impurities'},
+                        {'step': 'Treat', 'product': 'Treatment serum',
+                            'description': 'Target specific concerns'},
+                        {'step': 'Moisturize', 'product': 'Night cream',
+                            'description': 'Hydrate overnight'}
+                    ]
+                },
+                'recommendations': [
+                    'Use broad-spectrum sunscreen daily',
+                    'Perform monthly skin self-examinations',
+                    'Stay hydrated and maintain a healthy diet',
+                    'Avoid prolonged sun exposure'
+                ],
+                'warning_signs': [
+                    'New or changing moles',
+                    'Unusual growths or spots',
+                    'Non-healing sores',
+                    'Changes in skin texture or color'
+                ]
+            })
+
+        cursor = conn.cursor(dictionary=True)
+
+        # Get preventive care recommendations from database
+        cursor.execute("""
+            SELECT recommendations.* 
+            FROM preventive_care_recommendations recommendations
+            WHERE skin_type = %s
+            OR %s = ANY(concerns)
+            LIMIT 1
+        """, (skin_type, concerns))
+
+        result = cursor.fetchone()
+        cursor.close()
+        conn.close()
+
+        if result:
+            return jsonify(result)
+        else:
+            # Return default recommendations if none found
+            return jsonify({
+                'skin_type': skin_type,
+                'concerns': concerns,
+                'daily_routine': {
+                    'morning': [
+                        {'step': 'Cleanse', 'product': 'Gentle cleanser',
+                            'description': 'Use lukewarm water'},
+                        {'step': 'Moisturize', 'product': 'SPF moisturizer',
+                            'description': 'Apply evenly'},
+                        {'step': 'Protect', 'product': 'Sunscreen SPF 30+',
+                            'description': 'Reapply every 2 hours'}
+                    ],
+                    'evening': [
+                        {'step': 'Cleanse', 'product': 'Gentle cleanser',
+                            'description': 'Remove impurities'},
+                        {'step': 'Treat', 'product': 'Treatment serum',
+                            'description': 'Target specific concerns'},
+                        {'step': 'Moisturize', 'product': 'Night cream',
+                            'description': 'Hydrate overnight'}
+                    ]
+                },
+                'recommendations': [
+                    'Use broad-spectrum sunscreen daily',
+                    'Perform monthly skin self-examinations',
+                    'Stay hydrated and maintain a healthy diet',
+                    'Avoid prolonged sun exposure'
+                ],
+                'warning_signs': [
+                    'New or changing moles',
+                    'Unusual growths or spots',
+                    'Non-healing sores',
+                    'Changes in skin texture or color'
+                ]
+            })
+
+    except Exception as e:
+        print(f"Error in get_preventive_care: {str(e)}")
+        return jsonify({
+            'error': 'Internal server error',
+            'message': str(e)
+        }), 500
+
+
+@app.route('/api/disease-info', methods=['GET'])
+def get_disease_info():
+    """Get information about specific skin diseases"""
+    try:
+        disease_type = request.args.get('disease', 'general')
+
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({'error': 'Database connection failed'}), 500
+
+        cursor = conn.cursor(dictionary=True)
+
+        cursor.execute(
+            "SELECT * FROM preventive_care WHERE disease_type = %s", (disease_type,))
+        care_data = cursor.fetchone()
+
+        if not care_data:
+            cursor.execute(
+                "SELECT * FROM preventive_care WHERE disease_type = 'general'")
+            care_data = cursor.fetchone()
+
+        cursor.close()
+        conn.close()
+
         if care_data:
             return jsonify({
                 'disease_type': care_data['disease_type'],
@@ -1222,12 +1358,12 @@ def get_preventive_care():
             })
         else:
             return jsonify({'error': 'No preventive care data found'}), 404
-            
+
     except Exception as e:
         print(f"Preventive care error: {e}")
         return jsonify({'error': 'Failed to fetch preventive care information'}), 500
-    
-            
+
+
 @app.route('/api/xai-debug', methods=['POST'])
 def xai_debug():
     """Debug endpoint for XAI functionality"""
@@ -1331,11 +1467,11 @@ def verify_diagnosis():
         cursor = conn.cursor()
 
         query = """
-			INSERT INTO doctor_verifications 
-			(original_diagnosis, verified_diagnosis, doctor_id, image_id, is_correct, 
-			 confidence_score, notes, created_at)
-			VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
-		"""
+            INSERT INTO doctor_verifications 
+            (original_diagnosis, verified_diagnosis, doctor_id, image_id, is_correct, 
+             confidence_score, notes, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+        """
 
         values = (
             data['originalDiagnosis'],
@@ -1391,13 +1527,13 @@ def get_model_performance():
 
         # Calculate accuracy based on doctor verifications
         query = """
-			SELECT 
-				COUNT(*) as total_verifications,
-				SUM(CASE WHEN is_correct = 1 THEN 1 ELSE 0 END) as correct_predictions,
-				AVG(confidence_score) as avg_confidence
-			FROM doctor_verifications 
-			WHERE created_at >= DATE_SUB(NOW(), INTERVAL 15 DAY)
-		"""
+            SELECT 
+                COUNT(*) as total_verifications,
+                SUM(CASE WHEN is_correct = 1 THEN 1 ELSE 0 END) as correct_predictions,
+                AVG(confidence_score) as avg_confidence
+            FROM doctor_verifications 
+            WHERE created_at >= DATE_SUB(NOW(), INTERVAL 15 DAY)
+        """
 
         cursor.execute(query)
         performance_data = cursor.fetchone()
@@ -1485,17 +1621,17 @@ def get_retraining_metrics():
 
         # Get retraining history with better error handling
         query = """
-			SELECT 
-				DATE(created_at) as date,
-				COUNT(*) as verification_count,
-				AVG(confidence_score) as avg_confidence,
-				SUM(CASE WHEN is_correct = 1 THEN 1 ELSE 0 END) as correct_count
-			FROM doctor_verifications 
-			WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
-			GROUP BY DATE(created_at)
-			ORDER BY date DESC
-			LIMIT 30
-		"""
+            SELECT 
+                DATE(created_at) as date,
+                COUNT(*) as verification_count,
+                AVG(confidence_score) as avg_confidence,
+                SUM(CASE WHEN is_correct = 1 THEN 1 ELSE 0 END) as correct_count
+            FROM doctor_verifications 
+            WHERE created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+            GROUP BY DATE(created_at)
+            ORDER BY date DESC
+            LIMIT 30
+        """
 
         cursor.execute(query)
         metrics = cursor.fetchall()
@@ -1568,6 +1704,173 @@ def test_endpoint():
         'database_connected': get_db_connection() is not None,
         'timestamp': datetime.now().isoformat()
     })
+
+
+@app.route('/suggest_treatment', methods=['POST'])
+def suggest_treatment():
+    """Dynamic Treatment Suggestions based on diagnosis"""
+    try:
+        data = request.get_json()
+        disease = data.get('disease')
+        is_cancer = data.get('isCancer')
+        confidence = data.get('confidence')
+        detected_features = data.get('detectedFeatures', [])
+
+        if not disease:
+            return jsonify({'error': 'Disease parameter is required'}), 400
+
+        # Generate treatment suggestions based on diagnosis
+        treatment_suggestions = {
+            'urgency': 'HIGH' if is_cancer and confidence > 80 else 'MEDIUM' if is_cancer else 'LOW',
+            'recommendations': [
+                'Consult dermatologist for professional evaluation',
+                'Biopsy recommended for confirmation' if is_cancer else 'Regular monitoring advised'
+            ],
+            'nextSteps': [
+                'Schedule appointment with specialist',
+                'Document lesion characteristics',
+                'Follow up in 3 months' if not is_cancer else 'Immediate evaluation needed'
+            ]
+        }
+
+        return jsonify({
+            'disease': disease,
+            'isCancer': is_cancer,
+            'confidence': confidence,
+            'treatmentSuggestions': treatment_suggestions,
+            'detectedFeatures': detected_features,
+            'timestamp': datetime.now().isoformat()
+        })
+
+    except Exception as e:
+        print(f'Treatment suggestion error: {e}')
+        return jsonify({'error': 'Failed to generate treatment suggestions'}), 500
+
+
+@app.route('/api/dermatologists', methods=['GET'])
+def get_dermatologists():
+    """Find dermatologists near location"""
+    try:
+        lat = request.args.get('lat')
+        lng = request.args.get('lng')
+        radius = request.args.get('radius', 10)
+
+        if not lat or not lng:
+            return jsonify({'message': 'Latitude and longitude are required.'}), 400
+
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({'message': 'Database connection failed'}), 500
+
+        cursor = conn.cursor(dictionary=True)
+
+        query = """
+            SELECT id, name, specialty, experience, rating, address, phone, email,
+                   latitude, longitude,
+                   ( 6371 * acos( cos( radians(%s) ) * cos( radians( latitude ) ) * 
+                     cos( radians( longitude ) - radians(%s) ) + sin( radians(%s) ) * 
+                     sin( radians( latitude ) ) ) ) AS distance
+            FROM dermatologists
+            HAVING distance < %s
+            ORDER BY distance, rating DESC
+            LIMIT 20;
+        """
+
+        cursor.execute(query, (float(lat), float(
+            lng), float(lat), float(radius)))
+        results = cursor.fetchall()
+
+        cursor.close()
+        conn.close()
+
+        return jsonify(results)
+
+    except Exception as e:
+        print(f"Dermatologists query error: {e}")
+        return jsonify({'message': 'Server error'}), 500
+
+
+@app.route('/api/analysis-history', methods=['POST'])
+def save_analysis_history():
+    """Save analysis history with doctor verification data"""
+    try:
+        data = request.get_json()
+        user_id = data.get('userId')
+        analysis = data.get('analysis')
+        verification_data = data.get('verification', {})
+
+        if not user_id or not analysis:
+            return jsonify({'message': 'User ID and analysis data are required'}), 400
+
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({'message': 'Database connection failed'}), 500
+
+        cursor = conn.cursor()
+
+        query = """
+            INSERT INTO analysis_history 
+            (user_id, image_path, diagnosis, confidence, is_cancer, cancer_status, 
+             explanations, doctor_verified, doctor_correction, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+        """
+
+        values = (
+            user_id,
+            analysis.get('imagePath'),
+            analysis.get('diagnosis'),
+            analysis.get('confidence'),
+            analysis.get('isCancer'),
+            analysis.get('cancerStatus'),
+            json.dumps(analysis.get('explanations', {})),
+            verification_data.get('verified', False),
+            verification_data.get('correctedDiagnosis', None)
+        )
+
+        cursor.execute(query, values)
+        conn.commit()
+
+        history_id = cursor.lastrowid
+        cursor.close()
+        conn.close()
+
+        return jsonify({'success': True, 'historyId': history_id})
+
+    except Exception as e:
+        print(f"Analysis history error: {e}")
+        return jsonify({'message': 'Failed to save analysis history'}), 500
+
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    model_status = {
+        'unifiedModel': unified_model is not None,
+        'database': get_db_connection() is not None
+    }
+
+    return jsonify({
+        'status': 'healthy',
+        'models': model_status,
+        'timestamp': datetime.now().isoformat()
+    })
+
+
+@app.errorhandler(500)
+def internal_server_error(error):
+    return jsonify({
+        'error': 'Internal server error',
+        'message': 'Something went wrong on our end'
+    }), 500
+
+
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({
+        'error': 'Endpoint not found'
+    }), 404
+
+# Retraining functions (keep existing implementations)
 
 
 def retrain_model_async():
@@ -1681,39 +1984,39 @@ def collect_verified_data():
 
         # Query to get verified images and their correct diagnoses
         query = """
-			SELECT 
-				dv.verified_diagnosis as true_label,
-				dv.image_id,
-				ah.image_path,
-				dv.confidence_score,
-				dv.created_at
-			FROM doctor_verifications dv
-			JOIN analysis_history ah ON dv.image_id = ah.id
-			WHERE dv.is_correct = 0  # Doctor corrected the diagnosis
-				AND dv.verified_diagnosis IS NOT NULL
-				AND ah.image_path IS NOT NULL
-			ORDER BY dv.created_at DESC
-			LIMIT 1000
-		"""
+            SELECT 
+                dv.verified_diagnosis as true_label,
+                dv.image_id,
+                ah.image_path,
+                dv.confidence_score,
+                dv.created_at
+            FROM doctor_verifications dv
+            JOIN analysis_history ah ON dv.image_id = ah.id
+            WHERE dv.is_correct = 0  # Doctor corrected the diagnosis
+                AND dv.verified_diagnosis IS NOT NULL
+                AND ah.image_path IS NOT NULL
+            ORDER BY dv.created_at DESC
+            LIMIT 1000
+        """
 
         cursor.execute(query)
         verified_data = cursor.fetchall()
 
         # Also include correct predictions for balance
         query_correct = """
-			SELECT 
-				ah.diagnosis as true_label,
-				ah.id as image_id,
-				ah.image_path,
-				1.0 as confidence_score,
-				ah.created_at
-			FROM analysis_history ah
-			JOIN doctor_verifications dv ON ah.id = dv.image_id
-			WHERE dv.is_correct = 1  # Doctor confirmed the diagnosis was correct
-				AND ah.image_path IS NOT NULL
-			ORDER BY ah.created_at DESC
-			LIMIT 500
-		"""
+            SELECT 
+                ah.diagnosis as true_label,
+                ah.id as image_id,
+                ah.image_path,
+                1.0 as confidence_score,
+                ah.created_at
+            FROM analysis_history ah
+            JOIN doctor_verifications dv ON ah.id = dv.image_id
+            WHERE dv.is_correct = 1  # Doctor confirmed the diagnosis was correct
+                AND ah.image_path IS NOT NULL
+            ORDER BY ah.created_at DESC
+            LIMIT 500
+        """
 
         cursor.execute(query_correct)
         correct_data = cursor.fetchall()
@@ -1947,156 +2250,6 @@ def cleanup_old_backups(backup_dir):
         print(f"Error cleaning up backups: {e}")
 
 
-@app.route('/suggest_treatment', methods=['POST'])
-def suggest_treatment():
-    """Dynamic Treatment Suggestions based on diagnosis"""
-    try:
-        data = request.get_json()
-        disease = data.get('disease')
-        is_cancer = data.get('isCancer')
-        confidence = data.get('confidence')
-        detected_features = data.get('detectedFeatures', [])
-
-        if not disease:
-            return jsonify({'error': 'Disease parameter is required'}), 400
-
-        # Generate treatment suggestions based on diagnosis
-        treatment_suggestions = {
-            'urgency': 'HIGH' if is_cancer and confidence > 80 else 'MEDIUM' if is_cancer else 'LOW',
-            'recommendations': [
-                'Consult dermatologist for professional evaluation',
-                'Biopsy recommended for confirmation' if is_cancer else 'Regular monitoring advised'
-            ],
-            'nextSteps': [
-                'Schedule appointment with specialist',
-                'Document lesion characteristics',
-                'Follow up in 3 months' if not is_cancer else 'Immediate evaluation needed'
-            ]
-        }
-
-        return jsonify({
-            'disease': disease,
-            'isCancer': is_cancer,
-            'confidence': confidence,
-            'treatmentSuggestions': treatment_suggestions,
-            'detectedFeatures': detected_features,
-            'timestamp': datetime.now().isoformat()
-        })
-
-    except Exception as e:
-        print(f'Treatment suggestion error: {e}')
-        return jsonify({'error': 'Failed to generate treatment suggestions'}), 500
-
-
-@app.route('/api/dermatologists', methods=['GET'])
-def get_dermatologists():
-    """Find dermatologists near location"""
-    try:
-        lat = request.args.get('lat')
-        lng = request.args.get('lng')
-        radius = request.args.get('radius', 10)
-
-        if not lat or not lng:
-            return jsonify({'message': 'Latitude and longitude are required.'}), 400
-
-        conn = get_db_connection()
-        if not conn:
-            return jsonify({'message': 'Database connection failed'}), 500
-
-        cursor = conn.cursor(dictionary=True)
-
-        query = """
-			SELECT id, name, specialty, experience, rating, address, phone, email,
-				   latitude, longitude,
-				   ( 6371 * acos( cos( radians(%s) ) * cos( radians( latitude ) ) * 
-					 cos( radians( longitude ) - radians(%s) ) + sin( radians(%s) ) * 
-					 sin( radians( latitude ) ) ) ) AS distance
-			FROM dermatologists
-			HAVING distance < %s
-			ORDER BY distance, rating DESC
-			LIMIT 20;
-		"""
-
-        cursor.execute(query, (float(lat), float(
-            lng), float(lat), float(radius)))
-        results = cursor.fetchall()
-
-        cursor.close()
-        conn.close()
-
-        return jsonify(results)
-
-    except Exception as e:
-        print(f"Dermatologists query error: {e}")
-        return jsonify({'message': 'Server error'}), 500
-
-
-@app.route('/api/analysis-history', methods=['POST'])
-def save_analysis_history():
-    """Save analysis history with doctor verification data"""
-    try:
-        data = request.get_json()
-        user_id = data.get('userId')
-        analysis = data.get('analysis')
-        verification_data = data.get('verification', {})
-
-        if not user_id or not analysis:
-            return jsonify({'message': 'User ID and analysis data are required'}), 400
-
-        conn = get_db_connection()
-        if not conn:
-            return jsonify({'message': 'Database connection failed'}), 500
-
-        cursor = conn.cursor()
-
-        query = """
-			INSERT INTO analysis_history 
-			(user_id, image_path, diagnosis, confidence, is_cancer, cancer_status, 
-			 explanations, doctor_verified, doctor_correction, created_at)
-			VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-		"""
-
-        values = (
-            user_id,
-            analysis.get('imagePath'),
-            analysis.get('diagnosis'),
-            analysis.get('confidence'),
-            analysis.get('isCancer'),
-            analysis.get('cancerStatus'),
-            analysis.get('explanations'),
-            verification_data.get('verified', False),
-            verification_data.get('correctedDiagnosis', None)
-        )
-
-        cursor.execute(query, values)
-        conn.commit()
-
-        history_id = cursor.lastrowid
-        cursor.close()
-        conn.close()
-
-        return jsonify({'success': True, 'historyId': history_id})
-
-    except Exception as e:
-        print(f"Analysis history error: {e}")
-        return jsonify({'message': 'Failed to save analysis history'}), 500
-
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    model_status = {
-        'unifiedModel': unified_model is not None,
-        'database': get_db_connection() is not None
-    }
-
-    return jsonify({
-        'status': 'healthy',
-        'models': model_status,
-        'timestamp': datetime.now().isoformat()
-    })
-
-
 if __name__ == '__main__':
     try:
         # Create necessary directories
@@ -2105,9 +2258,14 @@ if __name__ == '__main__':
         os.makedirs('models', exist_ok=True)
         os.makedirs('models/backup', exist_ok=True)
 
+        print("Initializing database and models...")
+        initialize_database()
+        load_models()
+        initialize_preventive_care()
+
         print(f"Starting Flask server on port {PORT}")
-        app.run(host='0.0.0.0', port=int(PORT), debug=True)
+        app.run(host='0.0.0.0', port=int(PORT), debug=False)
     except Exception as e:
         print(f"Error during startup: {str(e)}")
-        print("Starting server without AI functionality...")
-        app.run(host='0.0.0.0', port=int(PORT), debug=True)
+        # Try to start anyway with limited functionality
+        app.run(host='0.0.0.0', port=int(PORT), debug=False)
